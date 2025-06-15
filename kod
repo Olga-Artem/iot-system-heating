@@ -1,0 +1,26 @@
+smart-temp-control/
+├── controller/               # Основной контроллер
+│   ├── main/
+│   │   ├── CMakeLists.txt
+│   │   ├── component.mk
+│   │   └── main.c            # Главный код контроллера
+│   ├── components/
+│   │   ├── dht22/            # Драйвер датчика DHT22
+│   │   └── wifi_connect/     # Модуль подключения к Wi-Fi
+│   └── sdkconfig
+├── remote/                   # Пульт ДУ
+│   ├── main/
+│   │   ├── CMakeLists.txt
+│   │   ├── component.mk
+│   │   └── main.c            # Главный код пульта
+│   └── components/
+│       └── lcd_i2c/          # Драйвер LCD дисплея
+├── nodered_flows/            # Конфигурация IoT-платформы
+│   └── temp_control.json
+├── schematics/               # Схемы подключения
+│   ├── controller_v1.pdf
+│   └── remote_v1.pdf
+├── docs/                     # Документация
+│   ├── presentation.pdf
+│   └── technical_guide.md
+└── README.md                 # Инструкция по сборке
