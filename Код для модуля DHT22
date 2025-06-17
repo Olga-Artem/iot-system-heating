@@ -1,0 +1,65 @@
+#include "dht22.h"
+#include "driver/gpio.h"
+#include "freertos/task.h"
+#include "esp_timer.h"
+#include "esp_log.h"
+
+#define TAG "DHT22"
+#define DHT_TIMEOUT 10000
+
+static void dht_send_start_signal(dht22_handle_t sensor) {
+    gpio_set_direction(sensor->gpio_pin, GPIO_MODE_OUTPUT);
+    gpio_set_level(sensor->gpio_pin, 0);
+    ets_delay_us(18000);
+    gpio_set_level(sensor->gpio_pin, 1);
+    ets_delay_us(40);
+    gpio_set_direction(sensor->gpio_pin, GPIO_MODE_INPUT);
+}
+
+static uint8_t dht_read_byte(dht22_handle_t sensor) {
+    uint8_t byte = 0;
+    for (int i = 0; i < 8; i++) {
+        uint32_t start = esp_timer_get_time();
+        while (!gpio_get_level(sensor->gpio_pin)) {
+            if (esp_timer_get_time() - start > DHT_TIMEOUT) return 0;
+        }
+        
+        ets_delay_us(30);
+        byte <<= 1;
+        if (gpio_get_level(sensor->gpio_pin)) byte |= 1;
+        
+        start = esp_timer_get_time();
+        while (gpio_get_level(sensor->gpio_pin)) {
+            if (esp_timer_get_time() - start > DHT_TIMEOUT) return 0;
+        }
+    }
+    return byte;
+}
+
+esp_err_t dht22_read(dht22_handle_t sensor, float *temperature, float *humidity) {
+    dht_send_start_signal(sensor);
+
+    uint32_t start = esp_timer_get_time();
+    while (gpio_get_level(sensor->gpio_pin)) {
+        if (esp_timer_get_time() - start > DHT_TIMEOUT) {
+            ESP_LOGE(TAG, "Timeout waiting for response");
+            return ESP_ERR_TIMEOUT;
+        }
+    }
+
+    uint8_t data[5] = {0};
+    for (int i = 0; i < 5; i++) {
+        data[i] = dht_read_byte(sensor);
+    }
+
+    if (data[4] != ((data[0] + data[1] + data[2] + data[3]) & 0xFF)) {
+        ESP_LOGE(TAG, "Checksum error");
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    *humidity = (data[0] << 8 | data[1]) * 0.1;
+    *temperature = ((data[2] & 0x7F) << 8 | data[3]) * 0.1;
+    if (data[2] & 0x80) *temperature *= -1;
+
+    return ESP_OK;
+}
