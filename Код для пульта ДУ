@@ -1,0 +1,103 @@
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_system.h"
+#include "esp_log.h"
+#include "driver/gpio.h"
+#include "esp_mqtt.h"
+#include "lcd_i2c.h"
+
+#define TAG "TEMP_REMOTE"
+#define MQTT_URI "mqtt://iot.eclipse.org:1883"
+#define MQTT_TOPIC_SETPOINT "temp_control/P279/setpoint"
+#define MQTT_TOPIC_CURRENT "temp_control/P279/current"
+
+#define BTN_UP GPIO_NUM_15
+#define BTN_DOWN GPIO_NUM_16
+#define BTN_MODE GPIO_NUM_17
+
+static esp_mqtt_client_handle_t mqtt_client;
+static lcd_handle_t lcd;
+static float current_temp = 0.0;
+static float target_temp = 22.0;
+
+static void mqtt_event_handler(void *args, esp_event_base_t base, 
+                               int32_t event_id, void *event_data) {
+    esp_mqtt_event_handle_t event = event_data;
+    
+    if (event->event_id == MQTT_EVENT_DATA && 
+        strncmp(event->topic, MQTT_TOPIC_CURRENT, event->topic_len) == 0) {
+        
+        char buffer[10];
+        strncpy(buffer, event->data, event->data_len);
+        buffer[event->data_len] = '\0';
+        current_temp = atof(buffer);
+    }
+}
+
+static void update_display() {
+    lcd_clear(lcd);
+    
+    char line1[17];
+    snprintf(line1, sizeof(line1), "Cur: %.1f°C", current_temp);
+    lcd_write_str(lcd, line1, 0, 0);
+    
+    char line2[17];
+    snprintf(line2, sizeof(line2), "Set: %.1f°C", target_temp);
+    lcd_write_str(lcd, line2, 1, 0);
+}
+
+static void button_task(void *pvParams) {
+    gpio_set_direction(BTN_UP, GPIO_MODE_INPUT);
+    gpio_set_direction(BTN_DOWN, GPIO_MODE_INPUT);
+    gpio_set_direction(BTN_MODE, GPIO_MODE_INPUT);
+    
+    uint32_t last_press = 0;
+    
+    while(1) {
+        if (gpio_get_level(BTN_UP) == 0 && 
+            (esp_timer_get_time() - last_press > 500000)) {
+            
+            target_temp += 0.5;
+            char temp_str[10];
+            snprintf(temp_str, sizeof(temp_str), "%.1f", target_temp);
+            esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_SETPOINT, temp_str, 0, 1, 0);
+            update_display();
+            last_press = esp_timer_get_time();
+        }
+        
+        if (gpio_get_level(BTN_DOWN) == 0 && 
+            (esp_timer_get_time() - last_press > 500000)) {
+            
+            target_temp -= 0.5;
+            char temp_str[10];
+            snprintf(temp_str, sizeof(temp_str), "%.1f", target_temp);
+            esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_SETPOINT, temp_str, 0, 1, 0);
+            update_display();
+            last_press = esp_timer_get_time();
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+void app_main() {
+    lcd = lcd_i2c_init(I2C_NUM_0, 0x27, 16, 2);
+    lcd_backlight(lcd, true);
+    lcd_write_str(lcd, "Initializing...", 0, 0);
+    
+    wifi_connect_init("YOUR_SSID", "YOUR_PASSWORD");
+
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .uri = MQTT_URI,
+        .event_handle = mqtt_event_handler,
+    };
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_start(mqtt_client);
+    esp_mqtt_client_subscribe(mqtt_client, MQTT_TOPIC_CURRENT, 1);
+    
+    xTaskCreate(button_task, "btn_task", 2048, NULL, 5, NULL);
+    
+    update_display();
+    ESP_LOGI(TAG, "Remote initialized");
+}
