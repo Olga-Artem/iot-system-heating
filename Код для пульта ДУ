@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -10,94 +11,177 @@
 #define TAG "TEMP_REMOTE"
 #define MQTT_URI "mqtt://iot.eclipse.org:1883"
 #define MQTT_TOPIC_SETPOINT "temp_control/P279/setpoint"
-#define MQTT_TOPIC_CURRENT "temp_control/P279/current"
 
-#define BTN_UP GPIO_NUM_15
-#define BTN_DOWN GPIO_NUM_16
-#define BTN_MODE GPIO_NUM_17
+// Пины кнопок (согласно схеме)
+#define BTN_MENU GPIO_NUM_12    // Кнопка MENU
+#define BTN_TEST GPIO_NUM_13    // Кнопка TEST
+#define BTN_0 GPIO_NUM_14       // Кнопка 0
+#define BTN_1 GPIO_NUM_27       // Кнопка 1
+#define BTN_2 GPIO_NUM_26       // Кнопка 2
+#define BTN_3 GPIO_NUM_25       // Кнопка 3
+#define BTN_4 GPIO_NUM_33       // Кнопка 4
+#define BTN_5 GPIO_NUM_32       // Кнопка 5
+#define BTN_6 GPIO_NUM_35       // Кнопка 6
+#define BTN_7 GPIO_NUM_34       // Кнопка 7
+#define BTN_8 GPIO_NUM_39       // Кнопка 8
+#define BTN_9 GPIO_NUM_36       // Кнопка 9
 
 static esp_mqtt_client_handle_t mqtt_client;
 static lcd_handle_t lcd;
-static float current_temp = 0.0;
-static float target_temp = 22.0;
+static char input_buffer[3] = {0};  // Буфер для ввода температуры
+static uint8_t input_index = 0;     // Позиция ввода
+static bool input_mode = false;     // Флаг режима ввода
 
+// Обработчик MQTT (оставлен для совместимости)
 static void mqtt_event_handler(void *args, esp_event_base_t base, 
-                               int32_t event_id, void *event_data) {
-    esp_mqtt_event_handle_t event = event_data;
-    
-    if (event->event_id == MQTT_EVENT_DATA && 
-        strncmp(event->topic, MQTT_TOPIC_CURRENT, event->topic_len) == 0) {
-        
-        char buffer[10];
-        strncpy(buffer, event->data, event->data_len);
-        buffer[event->data_len] = '\0';
-        current_temp = atof(buffer);
-    }
-}
+                               int32_t event_id, void *event_data) {}
 
+// Функция обновления дисплея
 static void update_display() {
     lcd_clear(lcd);
     
-    char line1[17];
-    snprintf(line1, sizeof(line1), "Cur: %.1f°C", current_temp);
-    lcd_write_str(lcd, line1, 0, 0);
-    
-    char line2[17];
-    snprintf(line2, sizeof(line2), "Set: %.1f°C", target_temp);
-    lcd_write_str(lcd, line2, 1, 0);
+    if (input_mode) {
+        // Режим ввода температуры
+        char line1[17] = "Enter temp: ";
+        strncat(line1, input_buffer, sizeof(line1) - strlen(line1) - 1);
+        lcd_write_str(lcd, line1, 0, 0);
+        lcd_write_str(lcd, "Press MENU to confirm", 1, 0);
+    } else {
+        // Основной режим
+        lcd_write_str(lcd, "Temp Control System", 0, 0);
+        lcd_write_str(lcd, "Press 0-9 to set temp", 1, 0);
+    }
 }
 
-static void button_task(void *pvParams) {
-    gpio_set_direction(BTN_UP, GPIO_MODE_INPUT);
-    gpio_set_direction(BTN_DOWN, GPIO_MODE_INPUT);
-    gpio_set_direction(BTN_MODE, GPIO_MODE_INPUT);
+// Функция сброса ввода
+static void reset_input() {
+    input_index = 0;
+    memset(input_buffer, 0, sizeof(input_buffer));
+    input_mode = false;
+}
+
+// Функция отправки температуры
+static void send_temperature() {
+    if (input_index > 0) {
+        int temp = atoi(input_buffer);
+        if (temp >= 10 && temp <= 30) {
+            char temp_str[10];
+            snprintf(temp_str, sizeof(temp_str), "%d", temp);
+            esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_SETPOINT, temp_str, 0, 1, 0);
+            ESP_LOGI(TAG, "Temperature set to: %d°C", temp);
+        } else {
+            ESP_LOGW(TAG, "Invalid temperature: %d", temp);
+        }
+    }
+    reset_input();
+}
+
+// Обработка цифровых кнопок
+static void handle_digit_button(int digit) {
+    if (!input_mode) {
+        input_mode = true;
+        input_index = 0;
+    }
     
-    uint32_t last_press = 0;
+    if (input_index < 2) {
+        input_buffer[input_index++] = '0' + digit;
+        input_buffer[input_index] = '\0';
+    }
+    update_display();
+}
+
+// Задача обработки кнопок
+static void button_task(void *pvParams) {
+    // Инициализация всех кнопок
+    const gpio_num_t digit_buttons[] = {BTN_0, BTN_1, BTN_2, BTN_3, BTN_4, 
+                                       BTN_5, BTN_6, BTN_7, BTN_8, BTN_9};
+    
+    for (int i = 0; i < 10; i++) {
+        gpio_set_direction(digit_buttons[i], GPIO_MODE_INPUT);
+        gpio_set_pull_mode(digit_buttons[i], GPIO_PULLUP_ONLY);
+    }
+    
+    gpio_set_direction(BTN_MENU, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BTN_MENU, GPIO_PULLUP_ONLY);
+    
+    gpio_set_direction(BTN_TEST, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BTN_TEST, GPIO_PULLUP_ONLY);
+    
+    uint32_t last_press_time = 0;
+    const uint32_t debounce_delay = 200; // Защита от дребезга (мс)
     
     while(1) {
-        if (gpio_get_level(BTN_UP) == 0 && 
-            (esp_timer_get_time() - last_press > 500000)) {
-            
-            target_temp += 0.5;
-            char temp_str[10];
-            snprintf(temp_str, sizeof(temp_str), "%.1f", target_temp);
-            esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_SETPOINT, temp_str, 0, 1, 0);
-            update_display();
-            last_press = esp_timer_get_time();
+        uint32_t current_time = esp_timer_get_time() / 1000;
+        
+        // Обработка цифровых кнопок (0-9)
+        for (int i = 0; i < 10; i++) {
+            if (gpio_get_level(digit_buttons[i]) == 0 && 
+                (current_time - last_press_time > debounce_delay)) {
+                handle_digit_button(i);
+                last_press_time = current_time;
+                vTaskDelay(pdMS_TO_TICKS(debounce_delay));
+            }
         }
         
-        if (gpio_get_level(BTN_DOWN) == 0 && 
-            (esp_timer_get_time() - last_press > 500000)) {
-            
-            target_temp -= 0.5;
-            char temp_str[10];
-            snprintf(temp_str, sizeof(temp_str), "%.1f", target_temp);
-            esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_SETPOINT, temp_str, 0, 1, 0);
-            update_display();
-            last_press = esp_timer_get_time();
+        // Обработка кнопки MENU
+        if (gpio_get_level(BTN_MENU) == 0 && 
+            (current_time - last_press_time > debounce_delay)) {
+            if (input_mode) {
+                send_temperature();
+            } else {
+                input_mode = true;
+                input_index = 0;
+                update_display();
+            }
+            last_press_time = current_time;
+            vTaskDelay(pdMS_TO_TICKS(debounce_delay));
         }
         
-        vTaskDelay(pdMS_TO_TICKS(100));
+        // Обработка кнопки TEST
+        if (gpio_get_level(BTN_TEST) == 0 && 
+            (current_time - last_press_time > debounce_delay)) {
+            if (input_mode) {
+                reset_input();
+                ESP_LOGI(TAG, "Input reset");
+            } else {
+                // Установка температуры по умолчанию
+                char default_temp[] = "22";
+                esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_SETPOINT, default_temp, 0, 1, 0);
+                ESP_LOGI(TAG, "Default temperature set: 22°C");
+            }
+            update_display();
+            last_press_time = current_time;
+            vTaskDelay(pdMS_TO_TICKS(debounce_delay));
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
 void app_main() {
+    // Инициализация LCD
     lcd = lcd_i2c_init(I2C_NUM_0, 0x27, 16, 2);
     lcd_backlight(lcd, true);
-    lcd_write_str(lcd, "Initializing...", 0, 0);
     
+    // Инициализация Wi-Fi
     wifi_connect_init("YOUR_SSID", "YOUR_PASSWORD");
-
+    
+    // Инициализация MQTT
     esp_mqtt_client_config_t mqtt_cfg = {
         .uri = MQTT_URI,
         .event_handle = mqtt_event_handler,
     };
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_start(mqtt_client);
-    esp_mqtt_client_subscribe(mqtt_client, MQTT_TOPIC_CURRENT, 1);
     
-    xTaskCreate(button_task, "btn_task", 2048, NULL, 5, NULL);
+    // Запуск задачи обработки кнопок
+    xTaskCreate(button_task, "btn_task", 4096, NULL, 5, NULL);
     
+    // Первоначальное обновление дисплея
     update_display();
-    ESP_LOGI(TAG, "Remote initialized");
+    ESP_LOGI(TAG, "Remote control initialized");
+    
+    // Установка температуры по умолчанию при старте
+    char default_temp[] = "22";
+    esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_SETPOINT, default_temp, 0, 1, 0);
 }
