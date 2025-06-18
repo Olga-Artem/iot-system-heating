@@ -2,101 +2,405 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_system.h"
-#include "esp_wifi.h"
-#include "esp_event.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "esp_now.h"
+#include "esp_wifi.h"
+#include "driver/i2c.h"
 #include "driver/gpio.h"
-#include "esp_mqtt.h"
-#include "dht22.h"
-#include "wifi_connect.h"
+#include "esp_timer.h"
 
-#define TAG "TEMP_CONTROLLER"
-#define MQTT_URI "mqtt://iot.eclipse.org:1883"
-#define MQTT_TOPIC_SETPOINT "temp_control/P279/setpoint"
-#define MQTT_TOPIC_CURRENT "temp_control/P279/current"
-#define MQTT_TOPIC_STATE "temp_control/P279/state"
+#define TAG "MASTER_NODE"
 
-#define HEATER_PIN GPIO_NUM_23
-#define COOLER_PIN GPIO_NUM_22
-#define DHT_PIN GPIO_NUM_21
+// Конфигурация железа
+#define I2C_PORT I2C_NUM_0
+#define I2C_SDA_GPIO 21
+#define I2C_SCL_GPIO 22
+#define IR_RX_GPIO 15
+#define OLED_ADDR 0x3C
 
-static esp_mqtt_client_handle_t mqtt_client;
-static float target_temp = 22.0;
-static bool system_enabled = true;
+// MAC адрес Slave
+uint8_t slave_mac[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
 
-static void mqtt_event_handler(void *args, esp_event_base_t base, 
-                               int32_t event_id, void *event_data) {
-    esp_mqtt_event_handle_t event = event_data;
-    
-    if (event->event_id == MQTT_EVENT_DATA && 
-        strncmp(event->topic, MQTT_TOPIC_SETPOINT, event->topic_len) == 0) {
-        
-        char buffer[10];
-        strncpy(buffer, event->data, event->data_len);
-        buffer[event->data_len] = '\0';
-        target_temp = atof(buffer);
-        ESP_LOGI(TAG, "New target: %.1f°C", target_temp);
-    }
-}
+// Структура данных для ESP-NOW
+typedef struct {
+    float desired_temp;
+} esp_now_data_t;
 
-static void relay_init(gpio_num_t pin) {
-    gpio_reset_pin(pin);
-    gpio_set_direction(pin, GPIO_MODE_OUTPUT);
-    gpio_set_level(pin, 0);
-}
+// Глобальные переменные
+float current_temp = 0.0;
+float desired_temp = 22.0;
+bool input_mode = false;
+char input_buffer[3] = "";  // Буфер для ввода температуры (2 цифры + нулевой символ)
+uint8_t input_index = 0;
+QueueHandle_t ir_queue;
 
-static void temp_control_task(void *pvParams) {
-    dht22_config_t dht_config = {
-        .gpio_pin = DHT_PIN,
-        .update_interval_ms = 5000
+// Прототипы функций для OLED
+void oled_init();
+void oled_clear();
+void oled_update();
+void oled_write_string(int row, int col, const char *text);
+
+// Инициализация I2C
+void i2c_init() {
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_SDA_GPIO,
+        .scl_io_num = I2C_SCL_GPIO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 400000
     };
-    dht22_init(&dht_config);
+    ESP_ERROR_CHECK(i2c_param_config(I2C_PORT, &conf));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT, conf.mode, 0, 0, 0));
+}
 
-    while(1) {
-        float temp, humid;
-        if (dht22_read(&dht_config, &temp, &humid) == ESP_OK) {
-            char temp_str[10];
-            snprintf(temp_str, sizeof(temp_str), "%.1f", temp);
-            esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_CURRENT, temp_str, 0, 1, 0);
+// Обновление OLED дисплея
+void update_display() {
+    oled_clear();
+    
+    char line1[20];
+    snprintf(line1, sizeof(line1), "Cur: %.1fC", current_temp);
+    oled_write_string(0, 0, line1);
+    
+    if(input_mode) {
+        char line2[20];
+        snprintf(line2, sizeof(line2), "Set: %s_", input_buffer);
+        oled_write_string(2, 0, line2);
+    } else {
+        char line2[20];
+        snprintf(line2, sizeof(line2), "Des: %.1fC", desired_temp);
+        oled_write_string(2, 0, line2);
+    }
+    
+    oled_update();
+}
 
-            if (system_enabled) {
-                if (temp < target_temp - 0.5) {
-                    gpio_set_level(HEATER_PIN, 1);
-                    gpio_set_level(COOLER_PIN, 0);
-                    esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_STATE, "heating", 0, 1, 0);
-                } 
-                else if (temp > target_temp + 0.5) {
-                    gpio_set_level(HEATER_PIN, 0);
-                    gpio_set_level(COOLER_PIN, 1);
-                    esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_STATE, "cooling", 0, 1, 0);
-                }
-                else {
-                    gpio_set_level(HEATER_PIN, 0);
-                    gpio_set_level(COOLER_PIN, 0);
-                    esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_STATE, "idle", 0, 1, 0);
-                }
+// Отправка температуры через ESP-NOW
+void send_desired_temp() {
+    esp_now_data_t data = {
+        .desired_temp = desired_temp
+    };
+    esp_now_send(slave_mac, (uint8_t*)&data, sizeof(data));
+    ESP_LOGI(TAG, "Sent desired temp: %.1fC", desired_temp);
+}
+
+// Обработка ИК-команд
+void handle_ir_command(uint32_t cmd) {
+    switch(cmd) {
+        case 0x00: // Кнопка 0
+            if(input_mode && input_index < 2) {
+                input_buffer[input_index++] = '0';
+                input_buffer[input_index] = '\0';
             }
-        }
+            break;
+        case 0x01: // Кнопка 1
+            if(input_mode && input_index < 2) {
+                input_buffer[input_index++] = '1';
+                input_buffer[input_index] = '\0';
+            }
+            break;
+        case 0x02: // Кнопка 2
+            if(input_mode && input_index < 2) {
+                input_buffer[input_index++] = '2';
+                input_buffer[input_index] = '\0';
+            }
+            break;
+        case 0x03: // Кнопка 3
+            if(input_mode && input_index < 2) {
+                input_buffer[input_index++] = '3';
+                input_buffer[input_index] = '\0';
+            }
+            break;
+        case 0x04: // Кнопка 4
+            if(input_mode && input_index < 2) {
+                input_buffer[input_index++] = '4';
+                input_buffer[input_index] = '\0';
+            }
+            break;
+        case 0x05: // Кнопка 5
+            if(input_mode && input_index < 2) {
+                input_buffer[input_index++] = '5';
+                input_buffer[input_index] = '\0';
+            }
+            break;
+        case 0x06: // Кнопка 6
+            if(input_mode && input_index < 2) {
+                input_buffer[input_index++] = '6';
+                input_buffer[input_index] = '\0';
+            }
+            break;
+        case 0x07: // Кнопка 7
+            if(input_mode && input_index < 2) {
+                input_buffer[input_index++] = '7';
+                input_buffer[input_index] = '\0';
+            }
+            break;
+        case 0x08: // Кнопка 8
+            if(input_mode && input_index < 2) {
+                input_buffer[input_index++] = '8';
+                input_buffer[input_index] = '\0';
+            }
+            break;
+        case 0x09: // Кнопка 9
+            if(input_mode && input_index < 2) {
+                input_buffer[input_index++] = '9';
+                input_buffer[input_index] = '\0';
+            }
+            break;
+            
+        case 0x0A: // Кнопка MENU
+            if(input_mode) {
+                if(input_index > 0) {
+                    desired_temp = (float)atoi(input_buffer);
+                    if(desired_temp < 10) desired_temp = 10.0;
+                    if(desired_temp > 30) desired_temp = 30.0;
+                    send_desired_temp();
+                }
+                input_mode = false;
+            } else {
+                input_mode = true;
+                input_index = 0;
+                memset(input_buffer, 0, sizeof(input_buffer));
+            }
+            break;
+            
+        case 0x0B: // Кнопка TEST
+            if(input_mode) {
+                input_index = 0;
+                memset(input_buffer, 0, sizeof(input_buffer));
+            } else {
+                desired_temp = 22.0;
+                send_desired_temp();
+            }
+            break;
+    }
+    update_display();
+}
+
+// Задача чтения температуры
+void temp_read_task(void* arg) {
+    while(1) {
+        // В реальном проекте здесь будет чтение с датчика
+        current_temp = 22.0 + (esp_random() % 1000) * 0.01;
+        ESP_LOGI(TAG, "Temperature: %.1fC", current_temp);
+        update_display();
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 
-void app_main() {
-    ESP_ERROR_CHECK(nvs_flash_init());
-    wifi_connect_init("YOUR_SSID", "YOUR_PASSWORD");
+// Задача приема ИК-сигналов
+void ir_receiver_task(void* arg) {
+    while(1) {
+        uint32_t cmd = 0;
+        if(xQueueReceive(ir_queue, &cmd, portMAX_DELAY)) {
+            ESP_LOGI(TAG, "IR Command: 0x%X", cmd);
+            handle_ir_command(cmd);
+        }
+    }
+}
 
-    esp_mqtt_client_config_t mqtt_cfg = {
-        .uri = MQTT_URI,
-        .event_handle = mqtt_event_handler,
+// Прерывание для ИК-приемника
+static void IRAM_ATTR ir_rx_isr_handler(void* arg) {
+    static uint32_t last_cmd = 0;
+    static uint32_t last_time = 0;
+    uint32_t now = esp_timer_get_time();
+    
+    if((now - last_time) < 100000) return;
+    
+    uint32_t cmd = 0; // Здесь будет код декодирования ИК-сигнала
+    if(cmd != last_cmd) {
+        xQueueSendFromISR(ir_queue, &cmd, NULL);
+        last_cmd = cmd;
+        last_time = now;
+    }
+}
+
+// Callback отправки ESP-NOW
+void esp_now_send_cb(const uint8_t* mac, esp_now_send_status_t status) {
+    if(status != ESP_NOW_SEND_SUCCESS) {
+        ESP_LOGE(TAG, "ESP-NOW send failed");
+    } else {
+        ESP_LOGI(TAG, "ESP-NOW send success");
+    }
+}
+
+// Реализация OLED дисплея (SSD1306)
+static uint8_t oled_buffer[512]; // 128x32/8 = 512 байт
+
+void oled_send_cmd(uint8_t cmd) {
+    uint8_t buf[2] = {0x00, cmd};
+    i2c_master_write_to_device(I2C_PORT, OLED_ADDR, buf, sizeof(buf), pdMS_TO_TICKS(100));
+}
+
+void oled_send_data(const uint8_t *data, size_t len) {
+    uint8_t *buf = malloc(len + 1);
+    buf[0] = 0x40;
+    memcpy(buf + 1, data, len);
+    i2c_master_write_to_device(I2C_PORT, OLED_ADDR, buf, len + 1, pdMS_TO_TICKS(100));
+    free(buf);
+}
+
+void oled_init() {
+    // Инициализация дисплея
+    oled_send_cmd(0xAE); // Display off
+    oled_send_cmd(0xD5); // Set display clock
+    oled_send_cmd(0x80);
+    oled_send_cmd(0xA8); // Set multiplex
+    oled_send_cmd(0x1F); // 31 for 32px height
+    oled_send_cmd(0xD3); // Set display offset
+    oled_send_cmd(0x00);
+    oled_send_cmd(0x40); // Set start line
+    oled_send_cmd(0x8D); // Charge pump
+    oled_send_cmd(0x14);
+    oled_send_cmd(0x20); // Memory mode
+    oled_send_cmd(0x00);
+    oled_send_cmd(0xA1); // Segment remap
+    oled_send_cmd(0xC8); // COM output scan direction
+    oled_send_cmd(0xDA); // Set COM pins
+    oled_send_cmd(0x02);
+    oled_send_cmd(0x81); // Set contrast
+    oled_send_cmd(0x8F);
+    oled_send_cmd(0xD9); // Set precharge
+    oled_send_cmd(0xF1);
+    oled_send_cmd(0xDB); // Set vcom detect
+    oled_send_cmd(0x40);
+    oled_send_cmd(0xA4); // Display all on resume
+    oled_send_cmd(0xA6); // Normal display
+    oled_send_cmd(0xAF); // Display on
+    
+    oled_clear();
+}
+
+void oled_clear() {
+    memset(oled_buffer, 0, sizeof(oled_buffer));
+}
+
+void oled_update() {
+    oled_send_cmd(0x21); // Column address
+    oled_send_cmd(0x00);
+    oled_send_cmd(0x7F);
+    oled_send_cmd(0x22); // Page address
+    oled_send_cmd(0x00);
+    oled_send_cmd(0x03);
+    
+    oled_send_data(oled_buffer, sizeof(oled_buffer));
+}
+
+void oled_draw_char(int x, int y, char c) {
+    // Упрощенная реализация символов (5x8)
+    static const uint8_t font[][5] = {
+        {0x7C, 0x82, 0x82, 0x82, 0x7C}, // 0
+        {0x00, 0x84, 0xFE, 0x80, 0x00}, // 1
+        {0xC4, 0xA2, 0x92, 0x8A, 0x46}, // 2
+        {0x44, 0x82, 0x92, 0x92, 0x6C}, // 3
+        {0x30, 0x28, 0x24, 0xFE, 0x20}, // 4
+        {0x5E, 0x92, 0x92, 0x92, 0x62}, // 5
+        {0x78, 0x94, 0x92, 0x92, 0x60}, // 6
+        {0x06, 0x02, 0xE2, 0x12, 0x0E}, // 7
+        {0x6C, 0x92, 0x92, 0x92, 0x6C}, // 8
+        {0x0C, 0x92, 0x92, 0x52, 0x3C}, // 9
+        {0x00, 0x00, 0x00, 0x00, 0x00}, // space
+        {0x00, 0x00, 0xFA, 0x00, 0x00}, // :
+        {0x00, 0x00, 0x00, 0x00, 0x00}, // .
+        {0x00, 0x00, 0x00, 0x00, 0x00}, // C
+        {0x00, 0x00, 0x00, 0x00, 0x00}, // u
+        {0x00, 0x00, 0x00, 0x00, 0x00}, // r
+        {0x00, 0x00, 0x00, 0x00, 0x00}, // D
+        {0x00, 0x00, 0x00, 0x00, 0x00}, // e
+        {0x00, 0x00, 0x00, 0x00, 0x00}, // s
+        {0x00, 0x00, 0x00, 0x00, 0x00}  // _
     };
-    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_start(mqtt_client);
+    
+    int index = -1;
+    if(c >= '0' && c <= '9') index = c - '0';
+    else if(c == ' ') index = 10;
+    else if(c == ':') index = 11;
+    else if(c == '.') index = 12;
+    else if(c == 'C') index = 13;
+    else if(c == 'u') index = 14;
+    else if(c == 'r') index = 15;
+    else if(c == 'D') index = 16;
+    else if(c == 'e') index = 17;
+    else if(c == 's') index = 18;
+    else if(c == '_') index = 19;
+    
+    if(index < 0) return;
+    
+    for(int col = 0; col < 5; col++) {
+        uint8_t col_data = font[index][col];
+        for(int bit = 0; bit < 8; bit++) {
+            if(col_data & (1 << bit)) {
+                int pos = (y * 128) + (x + col) + (bit * 128);
+                if(pos < sizeof(oled_buffer)) {
+                    oled_buffer[pos] |= 1;
+                }
+            }
+        }
+    }
+}
 
-    relay_init(HEATER_PIN);
-    relay_init(COOLER_PIN);
+void oled_write_string(int row, int col, const char *text) {
+    int x = col * 6;
+    int y = row * 8;
+    for(int i = 0; text[i] != '\0'; i++) {
+        oled_draw_char(x, y, text[i]);
+        x += 6;
+        if(x > 122) break;
+    }
+}
 
-    xTaskCreate(temp_control_task, "temp_ctrl", 4096, NULL, 5, NULL);
-    ESP_LOGI(TAG, "System initialized");
+void app_main() {
+    // Инициализация NVS
+    ESP_ERROR_CHECK(nvs_flash_init());
+    
+    // Инициализация Wi-Fi и ESP-NOW
+    ESP_ERROR_CHECK(esp_netif_init());
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_send_cb(esp_now_send_cb));
+    
+    // Добавление пира
+    esp_now_peer_info_t peer = {
+        .channel = 0,
+        .encrypt = false
+    };
+    memcpy(peer.peer_addr, slave_mac, 6);
+    ESP_ERROR_CHECK(esp_now_add_peer(&peer));
+    
+    // Инициализация I2C
+    i2c_init();
+    
+    // Инициализация OLED
+    oled_init();
+    oled_clear();
+    oled_update();
+    
+    // Создание очереди для ИК-команд
+    ir_queue = xQueueCreate(10, sizeof(uint32_t));
+    
+    // Инициализация ИК-приемника
+    gpio_config_t ir_config = {
+        .pin_bit_mask = (1ULL << IR_RX_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .intr_type = GPIO_INTR_ANYEDGE
+    };
+    ESP_ERROR_CHECK(gpio_config(&ir_config));
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(IR_RX_GPIO, ir_rx_isr_handler, NULL);
+    
+    // Создание задач
+    xTaskCreate(temp_read_task, "temp_task", 4096, NULL, 5, NULL);
+    xTaskCreate(ir_receiver_task, "ir_task", 4096, NULL, 10, NULL);
+    
+    // Отправка начального значения
+    send_desired_temp();
+    update_display();
+    
+    ESP_LOGI(TAG, "Master node initialized");
 }
